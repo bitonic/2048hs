@@ -1,4 +1,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Play2048 where
 
 import           Prelude                               hiding (lines)
@@ -6,9 +8,10 @@ import           Control.Monad                         (forM_, when, mzero)
 import           Control.Monad.ST                      (ST, runST)
 import           Control.Monad.Trans.Class             (lift)
 import           Control.Monad.Trans.Maybe             (runMaybeT)
-import qualified Data.Array                            as A
 import qualified Data.Array.ST                         as A hiding (unsafeFreeze)
 import qualified Data.Array.Unsafe                     as A
+import qualified Data.Array.Unboxed                    as A
+import           Data.Int                              (Int8)
 import           Data.List                             (nub, intercalate)
 import           Data.Maybe                            (catMaybes)
 import           System.Random                         (RandomGen, randomR, getStdGen)
@@ -17,16 +20,31 @@ import           System.Random                         (RandomGen, randomR, getS
 -- Types
 ------------------------------------------------------------------------
 
-type Score = Int
+type Score = Int8
 
-data Tile
-    = Empty
-    | Full Score
-    deriving (Eq, Show)
+newtype Tile = Tile {unTile :: Score}
+    deriving (Eq, A.IArray A.UArray)
 
-isEmpty :: Tile -> Bool
-isEmpty Empty         = True
-isEmpty (Full _score) = False
+instance Show Tile where
+    show tile =
+        case isFullTile tile of
+            Nothing -> "Empty"
+            Just s  -> "Full " ++ show s
+
+emptyTile :: Tile
+emptyTile = Tile (-1)
+
+-- TODO remove the checks if this gets expensive
+fullTile :: Score -> Tile
+fullTile s | s < 0         = error "fullTile: negative argument"
+           | s == maxBound = error "fullTile: maximum bound reached"
+           | otherwise     = Tile s
+
+isEmptyTile :: Tile -> Bool
+isEmptyTile (Tile s) = s < 0
+
+isFullTile :: Tile -> Maybe Score
+isFullTile (Tile s) = if s >= 0 then Just s else Nothing
 
 type Row    = Int
 type Column = Int
@@ -34,8 +52,7 @@ type Column = Int
 boardSize :: Int
 boardSize = 4
 
--- TODO change to unboxed
-type Board = A.Array (Row, Column) Tile
+type Board = A.UArray (Row, Column) Tile
 
 type MutableBoard s = A.STArray s (Row, Column) Tile
 
@@ -58,10 +75,10 @@ descIndices = [boardSize, (boardSize - 1) .. 1]
 
 emptyBoard :: Board
 emptyBoard = boardFromList
-    [ [Empty, Empty, Empty, Empty]
-    , [Empty, Empty, Empty, Empty]
-    , [Empty, Empty, Empty, Empty]
-    , [Empty, Empty, Empty, Empty]
+    [ [emptyTile, emptyTile, emptyTile, emptyTile]
+    , [emptyTile, emptyTile, emptyTile, emptyTile]
+    , [emptyTile, emptyTile, emptyTile, emptyTile]
+    , [emptyTile, emptyTile, emptyTile, emptyTile]
     ]
 
 boardFromList :: [[Tile]] -> Board
@@ -107,7 +124,7 @@ writeBoardLines (orientation, direction) lines = runST modify
     modify :: forall s. ST s Board
     modify = do
         mutBoard :: MutableBoard s <-
-            A.newArray ((1, 1), (boardSize, boardSize)) Empty
+            A.newArray ((1, 1), (boardSize, boardSize)) emptyTile
         forM_ (zip outerIndices lines) $ \(outer, line) ->
             forM_ (zip innerIndices line) $ \(inner, tile) ->
                 A.writeArray mutBoard (index (outer, inner)) tile
@@ -121,7 +138,7 @@ newTile :: RandomGen g => g -> (Tile, g)
 newTile gen0 =
     let (n :: Int, gen1) = randomR (1, 10) gen0
         score            = if n > 1 then 0 else 1
-    in  (Full score, gen1)
+    in  (fullTile score, gen1)
 
 spawnPiece :: forall g. RandomGen g => Board -> g -> Maybe (Board, g)
 spawnPiece board gen0 =
@@ -131,7 +148,7 @@ spawnPiece board gen0 =
   where
     availableTiles = catMaybes
         [ let tile = board A.! (row, col)
-          in  if isEmpty tile then Just (row, col) else Nothing
+          in  if isEmptyTile tile then Just (row, col) else Nothing
         | (row, col) <- boardFringe
         ]
 
@@ -155,18 +172,19 @@ advanceLines lines = changed $ map (collapseLine . compactLine) $ lines
         if or (map (uncurry lineChanged) (zip lines lines'))
         then Just lines' else Nothing
 
-    lineChanged []       []         = False
-    lineChanged (_ : _)  []         = True
+    lineChanged []       []         = True
+    lineChanged (_ : _)  []         = False
     lineChanged []       (_ : _)    = error "applyMove': the impossible happened"
     lineChanged (t : ts) (t' : ts') =
         if t == t' then lineChanged ts ts' else True
 
-    compactLine = filter (/= Empty)
+    compactLine = filter (not . isEmptyTile)
 
     collapseLine [] =
         []
-    collapseLine (Full s : Full s' : tiles) | s == s' =
-        (Full (s + 1) :) $ collapseLine tiles
+    collapseLine ((isFullTile -> Just s) : (isFullTile -> Just s') : tiles) | s == s' =
+        -- TODO check for overflow
+        (fullTile (s + 1) :) $ collapseLine tiles
     collapseLine (tile : tiles) =
         (tile :) $ collapseLine tiles
 
@@ -178,6 +196,22 @@ play board0 move gen0 =
              -- TODO Proper error handling here, we should never get
              -- a 'Nothing'.
              spawnPiece (writeBoardLines move lines) gen0
+
+------------------------------------------------------------------------
+-- Board hashing
+------------------------------------------------------------------------
+
+-- boardToByteString :: Board -> ByteString
+-- boardToByteString = undefined
+
+-- byteStringToBoard :: ByteString -> Maybe Board
+-- byteStringToBoard = undefined
+
+------------------------------------------------------------------------
+-- Board evaluation
+------------------------------------------------------------------------
+
+type EvalBoard = Board -> Double
 
 ------------------------------------------------------------------------
 -- Drawing
@@ -198,10 +232,12 @@ drawBoard board = do
         putStr $ intercalate "-" $ replicate boardSize "--"
         putStrLn "+"
 
-    drawTile Empty = putStr "  "
-    drawTile (Full score) = do
-        when (score < 10) $ putStr " "
-        putStr $ show score
+    drawTile tile =
+        case isFullTile tile of
+            Nothing    -> putStr "  "
+            Just score -> do
+                when (score < 10) $ putStr " "
+                putStr $ show score
 
 ------------------------------------------------------------------------
 -- Main routine
