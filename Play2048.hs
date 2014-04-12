@@ -11,12 +11,12 @@ import           Control.Monad.ST                      (ST, runST, stToIO, RealW
 import           Control.Monad.Trans.Class             (lift)
 import           Control.Monad.Trans.Maybe             (runMaybeT)
 import qualified Data.Array.ST                         as A hiding (unsafeFreeze)
-import qualified Data.Array.Unsafe                     as A
 import qualified Data.Array.Unboxed                    as A
-import           Data.Functor                          ((<$>))
-import qualified Data.Hashable                         as Hashable
-import qualified Data.HashTable.ST.Basic               as HT
+import qualified Data.Array.Unsafe                     as A
 import           Data.Char                             (isSpace)
+import           Data.Functor                          ((<$>))
+import qualified Data.HashTable.ST.Basic               as HT
+import qualified Data.Hashable                         as Hashable
 import           Data.Int                              (Int8)
 import           Data.List                             (nub, intercalate, sortBy, intersperse)
 import           Data.List.NonEmpty                    (NonEmpty(..), toList)
@@ -24,8 +24,9 @@ import           Data.List.Split                       (splitOn, chunksOf)
 import           Data.Ord                              (comparing)
 import           Data.STRef                            (newSTRef, modifySTRef', STRef, readSTRef)
 import           Safe                                  (headMay)
+import           System.Environment                    (getArgs)
+import           System.IO                             (hSetBuffering, stdout, stdin, BufferMode(NoBuffering))
 import           System.Random                         (RandomGen, randomR, getStdGen)
-import           System.IO                             (hSetBuffering, stdin, stdout, BufferMode(NoBuffering))
 
 ------------------------------------------------------------------------
 -- Tile
@@ -411,10 +412,25 @@ mainSolver = do
   where
     fi = fromIntegral
 
-main :: IO ()
-main = do
+mainAuto :: IO ()
+mainAuto = do
+    gen   <- getStdGen
+    solve <- mainSolver
+    let (boardInit, gen') = spawnPiece boardEmpty gen
+    go solve boardInit gen'
+  where
+    go solve board0 gen0 = do
+        drawBoard board0
+        mbMove <- solve board0
+        case mbMove of
+            Nothing   -> drawBoard board0
+            Just move -> do
+                 Just (board1, gen1) <- return $ play board0 move gen0
+                 go solve board1 gen1
+
+mainPlay :: IO ()
+mainPlay = do
     hSetBuffering stdin NoBuffering
-    hSetBuffering stdout NoBuffering
 
     gen   <- getStdGen
     solve <- mainSolver
@@ -459,3 +475,11 @@ main = do
                 (Horizontal, Reversed) -> "right"
                 (Vertical,   Normal)   -> "down"
                 (Vertical,   Reversed) -> "up"
+
+main :: IO ()
+main = do
+    [mode] <- getArgs
+    case mode of
+        "auto" -> mainAuto
+        "play" -> mainPlay
+        _      -> putStrLn "Wrong usage"
