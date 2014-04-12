@@ -5,22 +5,27 @@ module Main where
 
 import           Prelude                               hiding (lines)
 
-import           Control.Monad                         (forM_, when, mzero)
-import           Control.Monad.ST                      (ST, runST)
+import           Control.Applicative                   ((<*>))
+import           Control.Monad                         (forM_, when, mzero, liftM, forM)
+import           Control.Monad.ST                      (ST, runST, stToIO, RealWorld)
 import           Control.Monad.Trans.Class             (lift)
 import           Control.Monad.Trans.Maybe             (runMaybeT)
 import qualified Data.Array.ST                         as A hiding (unsafeFreeze)
 import qualified Data.Array.Unsafe                     as A
 import qualified Data.Array.Unboxed                    as A
+import           Data.Functor                          ((<$>))
 import qualified Data.Hashable                         as Hashable
+import qualified Data.HashTable.ST.Basic               as HT
 import           Data.Char                             (isSpace)
 import           Data.Int                              (Int8)
 import           Data.List                             (nub, intercalate, sortBy, intersperse)
 import           Data.List.NonEmpty                    (NonEmpty(..), toList)
 import           Data.List.Split                       (splitOn, chunksOf)
 import           Data.Ord                              (comparing)
+import           Data.STRef                            (newSTRef, modifySTRef', STRef, readSTRef)
 import           Safe                                  (headMay)
 import           System.Random                         (RandomGen, randomR, getStdGen)
+import           System.IO                             (hSetBuffering, stdin, stdout, BufferMode(NoBuffering))
 
 ------------------------------------------------------------------------
 -- Tile
@@ -61,7 +66,14 @@ type Column = Int
 boardSize :: Int
 boardSize = 4
 
-type Board = A.UArray (Row, Column) Tile
+newtype Board = Board {unBoard :: A.UArray (Row, Column) Tile}
+    deriving (Eq, Show)
+
+instance Hashable.Hashable Board where
+    hashWithSalt salt = Hashable.hashWithSalt salt . A.elems . unBoard
+
+boardIx :: Board -> (Row, Column) -> Tile
+boardIx (Board b) ix = b A.! ix
 
 type MutableBoard s = A.STArray s (Row, Column) Tile
 
@@ -100,7 +112,7 @@ boardEmpty = boardFromList
 
 boardFromList :: [[Tile]] -> Board
 boardFromList lines
-    | length lines == boardSize && all ((== boardSize) . length) lines =
+    | length lines == boardSize && all ((== boardSize) . length) lines = Board $
         A.array ((1, 1), (boardSize, boardSize)) $
         concat [ [((row, col), tile) | (col, tile) <- zip ascIndices tiles]
                | (row, tiles) <- zip descIndices lines
@@ -109,13 +121,14 @@ boardFromList _lines =
     error "boardFromList: invalid lines"
 
 boardFringe :: [(Row, Column)]
-boardFringe = nub $ [(row, col) | row <- [1..boardSize], col <- [1, boardSize]] ++
-                    [(row, col) | col <- [1..boardSize], row <- [1, boardSize]]
+boardFringe = nub $
+    [(row, col) | row <- [1..boardSize], col <- [1, boardSize]] ++
+    [(row, col) | col <- [1..boardSize], row <- [1, boardSize]]
 
 boardEmptyTiles :: Board -> [(Row, Column)]
 boardEmptyTiles board =
     [ (row, col)
-    | (row, col) <- boardFringe, tileIsEmpty (board A.! (row, col))
+    | (row, col) <- boardFringe, tileIsEmpty (boardIx board (row, col))
     ]
 
 ------------------------------------------------------------------------
@@ -124,13 +137,13 @@ boardEmptyTiles board =
 
 getMoveLines :: Board -> Move -> [[Tile]]
 getMoveLines board (Horizontal, Normal) =
-    [[board A.! (row, col) | col <- ascIndices]  | row <- ascIndices]
+    [[boardIx board (row, col) | col <- ascIndices]  | row <- ascIndices]
 getMoveLines board (Horizontal, Reversed) =
-    [[board A.! (row, col) | col <- descIndices] | row <- ascIndices]
+    [[boardIx board (row, col) | col <- descIndices] | row <- ascIndices]
 getMoveLines board (Vertical,   Normal)   =
-    [[board A.! (row, col) | row <- ascIndices]  | col <- ascIndices]
+    [[boardIx board (row, col) | row <- ascIndices]  | col <- ascIndices]
 getMoveLines board (Vertical,   Reversed) =
-    [[board A.! (row, col) | row <- descIndices] | col <- ascIndices]
+    [[boardIx board (row, col) | row <- descIndices] | col <- ascIndices]
 
 writeMoveLines :: Move -> [[Tile]] -> Board
 writeMoveLines (orientation, direction) lines = runST modify
@@ -147,12 +160,11 @@ writeMoveLines (orientation, direction) lines = runST modify
 
     modify :: forall s. ST s Board
     modify = do
-        mutBoard :: MutableBoard s <-
-            A.newArray ((1, 1), (boardSize, boardSize)) tileEmpty
+        mutBoard :: MutableBoard s <- A.thaw $ unBoard boardEmpty
         forM_ (zip outerIndices lines) $ \(outer, line) ->
             forM_ (zip innerIndices line) $ \(inner, tile) ->
                 A.writeArray mutBoard (index (outer, inner)) tile
-        A.unsafeFreeze mutBoard
+        Board <$> A.unsafeFreeze mutBoard
 
 advanceMoveLines :: [[Tile]] -> Maybe [[Tile]]
 advanceMoveLines lines = changed $ map (collapseLine . compactLine) $ lines
@@ -215,9 +227,9 @@ possibleSpawns board =
 
     modify :: forall s. (Row, Column) -> Tile -> ST s Board
     modify tileIx tile = do
-        mutBoard :: MutableBoard s <- A.thaw board
+        mutBoard :: MutableBoard s <- A.thaw $ unBoard board
         A.writeArray mutBoard tileIx tile
-        A.unsafeFreeze mutBoard
+        Board <$> A.unsafeFreeze mutBoard
 
 play :: RandomGen g => Board -> Move -> g -> Maybe (Board, g)
 play board0 move gen0 =
@@ -226,23 +238,13 @@ play board0 move gen0 =
          Just lines -> Just $ spawnPiece (writeMoveLines move lines) gen0
 
 ------------------------------------------------------------------------
--- Board hashing
-------------------------------------------------------------------------
-
--- boardToByteString :: Board -> ByteString
--- boardToByteString = undefined
-
--- byteStringToBoard :: ByteString -> Maybe Board
--- byteStringToBoard = undefined
-
-------------------------------------------------------------------------
 -- Board evaluation
 ------------------------------------------------------------------------
 
 type BoardScore = Double
 
 -- | TODO carry the possible moves and the empty tiles here.
-type BoardEvaluator = Board -> BoardScore
+type BoardEvaluator m = Board -> m BoardScore
 
 resizeDouble :: (Double, Double) -> Double -> Double
 resizeDouble (lo, hi) x = lo' + (x * ((hi' - lo') / (hi - lo)))
@@ -253,15 +255,15 @@ resizeDouble (lo, hi) x = lo' + (x * ((hi' - lo') / (hi - lo)))
 
 -- | Evaluates the board between -1 and 1 depending on the spaces left
 -- (lower score = less space left).
-spacesLeftEvaluator :: BoardEvaluator
+spacesLeftEvaluator :: Monad m => BoardEvaluator m
 spacesLeftEvaluator =
-    resizeDouble (0, maxSpacesLeft) . fromIntegral . length . boardEmptyTiles
+    return . resizeDouble (0, maxSpacesLeft) . fromIntegral . length . boardEmptyTiles
   where
     maxSpacesLeft = fromIntegral $ length boardFringe
 
 -- | -1 if the board doesn't have moves, 0 otherwise.
-losingEvaluator :: BoardEvaluator
-losingEvaluator board =
+losingEvaluator :: Monad m => BoardEvaluator m
+losingEvaluator board = return $
     if null (possibleMoves board) && null (boardEmptyTiles board)
     then -1 else 0
 
@@ -276,52 +278,77 @@ losingEvaluator board =
 --         Just s <- tileIsFull <$> A.elems board
 --         return $ 2 ^ s
 
-compoundEvaluator :: [(Double, BoardEvaluator)] -> BoardEvaluator
+compoundEvaluator :: Monad m => [(Double, BoardEvaluator m)] -> BoardEvaluator m
 compoundEvaluator evals board =
-    sum $ [multiplier * eval board | (multiplier, eval) <- evals]
+    sum `liftM` mapM (\(multiplier, eval) -> (multiplier *) `liftM` eval board) evals
 
 -- Combinators
 --------------
 
-spawnsEvaluator :: BoardEvaluator -> BoardEvaluator
-spawnsEvaluator eval =
-    sum . toList . fmap (\(p, board1) -> p * eval board1) . possibleSpawns
+spawnsEvaluator :: Monad m => BoardEvaluator m -> BoardEvaluator m
+spawnsEvaluator eval board = do
+    let spawns = toList $ possibleSpawns board
+    sum `liftM` mapM (\(p, board1) -> (p *) `liftM` eval board1) spawns
 
-searchEvaluator :: BoardEvaluator -> BoardEvaluator
-searchEvaluator eval = go 0
+type Depth = Int
+
+data SearchState s = SearchState
+    { ssTable     :: HT.HashTable s (Board, Depth) BoardScore
+    , ssTableSize :: STRef s Integer
+    , ssLookups   :: STRef s Integer
+    }
+
+newSearchState :: ST s (SearchState s)
+newSearchState =
+    SearchState <$> HT.new <*> newSTRef 0 <*> newSTRef 0
+
+searchEvaluator
+    :: forall s. BoardEvaluator (ST s)
+    -> SearchState s
+    -> BoardEvaluator (ST s)
+searchEvaluator eval searchState = go 0
   where
     maxDepth :: Int
     maxDepth = 2
 
-    go :: Int -> BoardEvaluator
-    go depth board =
-        -- If there are no possible moves we just return the score,
-        -- hoping that the evaluator will penalize a losing board
-        -- accordingly.
-        if depth >= maxDepth || null nextBoards
-        then boardScore
-        else maximum $ map (spawnsEvaluator (go (depth + 1))) nextBoards
+    -- TODO shall we lookup or get the score if we have reached the
+    -- maximum depth?
+    go :: Depth -> BoardEvaluator (ST s)
+    go depth board = do
+        modifySTRef' (ssLookups searchState) (+ 1)
+        mbScore <- HT.lookup (ssTable searchState) (board, depth)
+        case mbScore of
+            Just score -> return score
+            Nothing -> do
+                score <-
+                    -- If there are no possible moves we just return the
+                    -- score, hoping that the evaluator will penalize a
+                    -- losing board accordingly.
+                    if depth >= maxDepth || null nextBoards
+                    then eval board
+                    else maximum <$> mapM (spawnsEvaluator (go (depth + 1))) nextBoards
+                modifySTRef' (ssTableSize searchState) (+ 1)
+                HT.insert (ssTable searchState) (board, depth) score
+                return score
       where
-        boardScore = eval board
-
         nextBoards = map snd $ possibleMoves board
 
 -- Sample evaluators
 --------------------
 
-evaluator1 :: BoardEvaluator
+evaluator1 :: Monad m => BoardEvaluator m
 evaluator1 =
-    searchEvaluator
-    (compoundEvaluator [(10000, losingEvaluator), (1, spacesLeftEvaluator)])
+    compoundEvaluator [(10000, losingEvaluator), (1, spacesLeftEvaluator)]
 
 -- Actual solver
 -----------------
 
-solver :: BoardEvaluator -> Board -> Maybe Move
-solver eval board0 = fmap fst $ headMay $ sortBy (comparing snd) $
-    [ (move, negate (spawnsEvaluator eval board1))
-    | (move, board1) <- possibleMoves board0
-    ]
+solver :: Monad m => BoardEvaluator m -> Board -> m (Maybe Move)
+solver eval board0 = do
+    moves <- forM (possibleMoves board0) $ \(move, board1) -> do
+        score <- spawnsEvaluator eval board1
+        return (move, negate score)
+    return $ fmap fst $ headMay $ sortBy (comparing snd) $ moves
 
 ------------------------------------------------------------------------
 -- Drawing
@@ -333,7 +360,7 @@ drawBoard board = do
         drawBorder      
         forM_ ascIndices $ \col -> do
             putStr "|"
-            drawTile $ board A.! (row, col)
+            drawTile $ boardIx board (row, col)
         putStrLn "|"
     drawBorder
   where
@@ -371,18 +398,34 @@ almost1024 = parseBoard $ concat $ intersperse "|" $
 -- Main routine
 ------------------------------------------------------------------------
 
+mainSolver :: IO (Board -> IO (Maybe Move))
+mainSolver = do
+    searchState <- stToIO newSearchState
+    return $ \board -> do
+        mbMove <- stToIO $ solver (searchEvaluator evaluator1 searchState) board
+        lookups <- stToIO $ readSTRef $ ssLookups searchState
+        tableSize <- stToIO $ readSTRef $ ssTableSize searchState
+        putStrLn $ "Table size: " ++ show tableSize
+        putStrLn $ "Misses ratio: " ++ show (100 * fi tableSize / fi lookups :: Double) ++ "%"
+        return mbMove
+  where
+    fi = fromIntegral
+
 main :: IO ()
 main = do
-    gen <- getStdGen
+    hSetBuffering stdin NoBuffering
+    hSetBuffering stdout NoBuffering
+
+    gen   <- getStdGen
+    solve <- mainSolver
     let (boardInit, gen') = spawnPiece boardEmpty gen
-    go boardInit gen'
+    go solve boardInit gen'
   where
-    go board0 gen0 = do
+    go solve board0 gen0 = do
         drawBoard board0
-        putStrLn $ "Board score: " ++ show (evaluator1 board0)
-        putStrLn $ showSuggestedMove board0
+        showSuggestedMove solve board0
         (board1, gen1) <- getAndApplyMove board0 gen0
-        go board1 gen1
+        go solve board1 gen1
 
     getAndApplyMove board0 gen0 = do
         move <- getMove
@@ -407,10 +450,12 @@ main = do
                 _   -> mzero
         maybe getMove return mbMove
 
-    showSuggestedMove board = case solver evaluator1 board of
-        Nothing   -> "No suggested move."
-        Just move -> ("Suggested move: " ++) $ case move of
-            (Horizontal, Normal)   -> "left"
-            (Horizontal, Reversed) -> "right"
-            (Vertical,   Normal)   -> "down"
-            (Vertical,   Reversed) -> "up"
+    showSuggestedMove solve board = do
+        mbMove <- solve board
+        putStrLn $ case mbMove of
+            Nothing   -> "No suggested move."
+            Just move -> ("Suggested move: " ++) $ case move of
+                (Horizontal, Normal)   -> "left"
+                (Horizontal, Reversed) -> "right"
+                (Vertical,   Normal)   -> "down"
+                (Vertical,   Reversed) -> "up"
