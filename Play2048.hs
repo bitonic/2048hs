@@ -7,76 +7,27 @@ import           Prelude                               hiding (lines)
 
 import           Control.Applicative                   ((<*>))
 import           Control.Monad                         (forM_, when, mzero, liftM, forM)
-import           Control.Monad.ST                      (ST, runST, stToIO, RealWorld)
+import           Control.Monad.ST                      (ST, runST, stToIO)
 import           Control.Monad.Trans.Class             (lift)
 import           Control.Monad.Trans.Maybe             (runMaybeT)
-import qualified Data.Array.ST                         as A hiding (unsafeFreeze)
-import qualified Data.Array.Unboxed                    as A
-import qualified Data.Array.Unsafe                     as A
 import           Data.Char                             (isSpace)
 import           Data.Functor                          ((<$>))
 import qualified Data.HashTable.ST.Basic               as HT
-import qualified Data.Hashable                         as Hashable
-import           Data.Int                              (Int8)
-import           Data.List                             (nub, intercalate, sortBy, intersperse)
+import           Data.List                             (intercalate, sortBy, intersperse)
 import           Data.List.NonEmpty                    (NonEmpty(..), toList)
 import           Data.List.Split                       (splitOn, chunksOf)
+import           Data.Maybe                            (catMaybes)
 import           Data.Ord                              (comparing)
 import           Data.STRef                            (newSTRef, modifySTRef', STRef, readSTRef)
 import           Safe                                  (headMay)
 import           System.Environment                    (getArgs)
-import           System.IO                             (hSetBuffering, stdout, stdin, BufferMode(NoBuffering))
-import           System.Random                         (RandomGen, randomR, getStdGen)
+import           System.IO                             (hSetBuffering, stdin, BufferMode(NoBuffering))
+import qualified System.Random.MWC                     as MWC
 
-------------------------------------------------------------------------
--- Tile
-------------------------------------------------------------------------
-
-type Score = Int8
-
-newtype Tile = Tile {unTile :: Score}
-    deriving (Eq, Hashable.Hashable, A.IArray A.UArray)
-
-instance Show Tile where
-    showsPrec d tile =
-        case tileIsFull tile of
-            Nothing -> showString "Empty"
-            Just s  -> showParen (d > 11) $ showString "Full " . showsPrec 11 s
-
-tileEmpty :: Tile
-tileEmpty = Tile (-1)
-
--- TODO remove the checks if this gets expensive
-tileFull :: Score -> Tile
-tileFull s | s < 0     = error "tileFull: negative argument"
-           | otherwise = Tile s
-
-tileIsEmpty :: Tile -> Bool
-tileIsEmpty (Tile s) = s < 0
-
-tileIsFull :: Tile -> Maybe Score
-tileIsFull (Tile s) = if s >= 0 then Just s else Nothing
-
-------------------------------------------------------------------------
--- Board
-------------------------------------------------------------------------
-
-type Row    = Int
-type Column = Int
-
-boardSize :: Int
-boardSize = 4
-
-newtype Board = Board {unBoard :: A.UArray (Row, Column) Tile}
-    deriving (Eq, Show)
-
-instance Hashable.Hashable Board where
-    hashWithSalt salt = Hashable.hashWithSalt salt . A.elems . unBoard
-
-boardIx :: Board -> (Row, Column) -> Tile
-boardIx (Board b) ix = b A.! ix
-
-type MutableBoard s = A.STArray s (Row, Column) Tile
+import           Tile                                  (Tile, Score)
+import qualified Tile
+import           Board                                 (Board, Row, Column)
+import qualified Board                                 as Board
 
 ------------------------------------------------------------------------
 -- Move
@@ -94,57 +45,18 @@ moveDown  = (Vertical,   Normal)
 moveUp    = (Vertical,   Reversed)
 
 ------------------------------------------------------------------------
--- Board handling and creation
-------------------------------------------------------------------------
-
-ascIndices  :: [Int]
-ascIndices  = [1 .. boardSize]
-
-descIndices :: [Int]
-descIndices = [boardSize, (boardSize - 1) .. 1]
-
-boardEmpty :: Board
-boardEmpty = boardFromList
-    [ [tileEmpty, tileEmpty, tileEmpty, tileEmpty]
-    , [tileEmpty, tileEmpty, tileEmpty, tileEmpty]
-    , [tileEmpty, tileEmpty, tileEmpty, tileEmpty]
-    , [tileEmpty, tileEmpty, tileEmpty, tileEmpty]
-    ]
-
-boardFromList :: [[Tile]] -> Board
-boardFromList lines
-    | length lines == boardSize && all ((== boardSize) . length) lines = Board $
-        A.array ((1, 1), (boardSize, boardSize)) $
-        concat [ [((row, col), tile) | (col, tile) <- zip ascIndices tiles]
-               | (row, tiles) <- zip descIndices lines
-               ]
-boardFromList _lines =
-    error "boardFromList: invalid lines"
-
-boardFringe :: [(Row, Column)]
-boardFringe = nub $
-    [(row, col) | row <- [1..boardSize], col <- [1, boardSize]] ++
-    [(row, col) | col <- [1..boardSize], row <- [1, boardSize]]
-
-boardEmptyTiles :: Board -> [(Row, Column)]
-boardEmptyTiles board =
-    [ (row, col)
-    | (row, col) <- boardFringe, tileIsEmpty (boardIx board (row, col))
-    ]
-
-------------------------------------------------------------------------
 -- Game logic
 ------------------------------------------------------------------------
 
 getMoveLines :: Board -> Move -> [[Tile]]
 getMoveLines board (Horizontal, Normal) =
-    [[boardIx board (row, col) | col <- ascIndices]  | row <- ascIndices]
+    [[Board.read board (row, col) | col <- Board.ascIndices]  | row <- Board.ascIndices]
 getMoveLines board (Horizontal, Reversed) =
-    [[boardIx board (row, col) | col <- descIndices] | row <- ascIndices]
+    [[Board.read board (row, col) | col <- Board.descIndices] | row <- Board.ascIndices]
 getMoveLines board (Vertical,   Normal)   =
-    [[boardIx board (row, col) | row <- ascIndices]  | col <- ascIndices]
+    [[Board.read board (row, col) | row <- Board.ascIndices]  | col <- Board.ascIndices]
 getMoveLines board (Vertical,   Reversed) =
-    [[boardIx board (row, col) | row <- descIndices] | col <- ascIndices]
+    [[Board.read board (row, col) | row <- Board.descIndices] | col <- Board.ascIndices]
 
 writeMoveLines :: Move -> [[Tile]] -> Board
 writeMoveLines (orientation, direction) lines = runST modify
@@ -153,22 +65,23 @@ writeMoveLines (orientation, direction) lines = runST modify
         Horizontal -> \(outer, inner) -> (outer, inner)
         Vertical   -> \(outer, inner) -> (inner, outer)
 
-    outerIndices = ascIndices
+    outerIndices = Board.ascIndices
     
     innerIndices = case direction of
-        Normal   -> ascIndices
-        Reversed -> descIndices
+        Normal   -> Board.ascIndices
+        Reversed -> Board.descIndices
 
     modify :: forall s. ST s Board
     modify = do
-        mutBoard :: MutableBoard s <- A.thaw $ unBoard boardEmpty
+        mutBoard :: Board.Mutable s <- Board.thaw Board.empty 
         forM_ (zip outerIndices lines) $ \(outer, line) ->
             forM_ (zip innerIndices line) $ \(inner, tile) ->
-                A.writeArray mutBoard (index (outer, inner)) tile
-        Board <$> A.unsafeFreeze mutBoard
+                Board.write mutBoard (index (outer, inner)) tile
+        Board.unsafeFreeze mutBoard
 
 advanceMoveLines :: [[Tile]] -> Maybe [[Tile]]
-advanceMoveLines lines = changed $ map (collapseLine . compactLine) $ lines
+advanceMoveLines lines =
+    changed $ map (map Tile.full . collapseLine . compactLine) $ lines
   where
     changed lines' =
         if or (map (uncurry lineChanged) (zip lines lines'))
@@ -180,19 +93,19 @@ advanceMoveLines lines = changed $ map (collapseLine . compactLine) $ lines
     lineChanged (t : ts) (t' : ts') =
         if t == t' then lineChanged ts ts' else True
 
-    compactLine = filter (not . tileIsEmpty)
+    compactLine = catMaybes . map Tile.isFull
 
     collapseLine [] =
         []
-    collapseLine ((tileIsFull -> Just s) : (tileIsFull -> Just s') : tiles) | s == s' =
-        (tileFull (s + 1) :) $ collapseLine tiles
+    collapseLine (s : s' : tiles) | s == s' =
+        ((s + 1) :) $ collapseLine tiles
     collapseLine (tile : tiles) =
         (tile :) $ collapseLine tiles
 
-spawnPiece :: RandomGen g => Board -> g -> (Board, g)
-spawnPiece board gen0 =
-    let (p, gen1) = randomR (0, 1) gen0
-    in  (pickSpawn 0 p spawns, gen1)
+spawnPiece :: Board -> MWC.GenST s -> ST s Board
+spawnPiece board gen = do
+    p <- MWC.uniformR (0, 1) gen
+    return $ pickSpawn 0 p spawns
   where
     spawns = toList $ possibleSpawns board
 
@@ -214,29 +127,29 @@ possibleSpawns board =
         []       -> error "possibleSpawns: cannot spawn"
         (b : bs) -> b :| bs
   where
-    emptyTiles      = boardEmptyTiles board
+    emptyTiles      = Board.emptyTiles board
     numEmptyTiles   = fromIntegral $ length emptyTiles
     highProbability = 0.9 / numEmptyTiles
     lowProbability  = 0.1 / numEmptyTiles
 
     boards = concat
-        [ [ (highProbability, runST (modify ix (tileFull 0)))
-          , (lowProbability,  runST (modify ix (tileFull 1)))
+        [ [ (highProbability, runST (modify ix (Tile.full 0)))
+          , (lowProbability,  runST (modify ix (Tile.full 1)))
           ]
         | ix <- emptyTiles
         ]
 
     modify :: forall s. (Row, Column) -> Tile -> ST s Board
     modify tileIx tile = do
-        mutBoard :: MutableBoard s <- A.thaw $ unBoard board
-        A.writeArray mutBoard tileIx tile
-        Board <$> A.unsafeFreeze mutBoard
+        mutBoard :: Board.Mutable s <- Board.thaw board
+        Board.write mutBoard tileIx tile
+        Board.unsafeFreeze mutBoard
 
-play :: RandomGen g => Board -> Move -> g -> Maybe (Board, g)
-play board0 move gen0 =
+play :: MWC.GenST s -> Board -> Move -> ST s (Maybe Board)
+play gen board0 move =
      case advanceMoveLines (getMoveLines board0 move) of
-         Nothing    -> Nothing
-         Just lines -> Just $ spawnPiece (writeMoveLines move lines) gen0
+         Nothing    -> return $ Nothing
+         Just lines -> Just <$> spawnPiece (writeMoveLines move lines) gen
 
 ------------------------------------------------------------------------
 -- Board evaluation
@@ -258,20 +171,39 @@ resizeDouble (lo, hi) x = lo' + (x * ((hi' - lo') / (hi - lo)))
 -- (lower score = less space left).
 spacesLeftEvaluator :: Monad m => BoardEvaluator m
 spacesLeftEvaluator =
-    return . resizeDouble (0, maxSpacesLeft) . fromIntegral . length . boardEmptyTiles
+    return . resizeDouble (0, maxSpacesLeft) . fromIntegral . length . Board.emptyTiles
   where
-    maxSpacesLeft = fromIntegral $ length boardFringe
+    maxSpacesLeft = fromIntegral $ length Board.fringe
+
+smoothnessEvaluator :: Monad m => BoardEvaluator m
+smoothnessEvaluator board = do
+    let horizLines = getMoveLines board moveLeft
+    let vertLines  = getMoveLines board moveDown
+    return $ negate $ resizeDouble (0, fromIntegral maxRoughness)
+           $ fromIntegral $ sum
+           $ map (lineSmoothness . catMaybes . map Tile.isFull)
+           $ horizLines ++ vertLines
+  where
+    maxRoughness =
+        let pairsAndLeftover = uncurry (+) $ Board.size `divMod` 2
+        in  pairsAndLeftover * 2 * (pairsAndLeftover * fromIntegral Tile.maxScore)
+
+    lineSmoothness :: [Score] -> Int
+    lineSmoothness []  = 0
+    lineSmoothness [s] = fromIntegral s
+    lineSmoothness (s : s' : tiles) =
+        fromIntegral (abs (s - s')) + lineSmoothness tiles
 
 -- | -1 if the board doesn't have moves, 0 otherwise.
 losingEvaluator :: Monad m => BoardEvaluator m
 losingEvaluator board = return $
-    if null (possibleMoves board) && null (boardEmptyTiles board)
+    if null (possibleMoves board) && null (Board.emptyTiles board)
     then -1 else 0
 
 -- scoreEvaluator :: BoardEvaluator
 -- scoreEvaluator = resizeDouble (0, maxScore) . fromIntegral . sumTiles
 --   where
---     numTiles = fromIntegral (boardSize * boardSize)
+--     numTiles = fromIntegral (Board.size * Board.size)
 
 --     maxScore = (2 ** (numTiles + 1)) * numTiles
 
@@ -339,7 +271,10 @@ searchEvaluator eval searchState = go 0
 
 evaluator1 :: Monad m => BoardEvaluator m
 evaluator1 =
-    compoundEvaluator [(10000, losingEvaluator), (1, spacesLeftEvaluator)]
+    compoundEvaluator [ (10000, losingEvaluator)
+                      , (10, smoothnessEvaluator)
+                      , (1, spacesLeftEvaluator)
+                      ]
 
 -- Actual solver
 -----------------
@@ -357,21 +292,21 @@ solver eval board0 = do
 
 drawBoard :: Board -> IO ()
 drawBoard board = do
-    forM_ descIndices $ \row -> do
+    forM_ Board.descIndices $ \row -> do
         drawBorder      
-        forM_ ascIndices $ \col -> do
+        forM_ Board.ascIndices $ \col -> do
             putStr "|"
-            drawTile $ boardIx board (row, col)
+            drawTile $ Board.read board (row, col)
         putStrLn "|"
     drawBorder
   where
     drawBorder = do
         putStr "+"
-        putStr $ intercalate "-" $ replicate boardSize "--"
+        putStr $ intercalate "-" $ replicate Board.size "--"
         putStrLn "+"
 
     drawTile tile =
-        case tileIsFull tile of
+        case Tile.isFull tile of
             Nothing    -> putStr "  "
             Just score -> do
                 when (score < 10) $ putStr " "
@@ -383,9 +318,9 @@ drawBoard board = do
 
 parseBoard :: String -> Board
 parseBoard =
-    boardFromList . map (map parseTile) . chunksOf boardSize . splitOn "|"
+    Board.fromList . map (map parseTile) . chunksOf Board.size . splitOn "|"
   where
-    parseTile x = if all isSpace x then tileEmpty else tileFull (read x)
+    parseTile x = if all isSpace x then Tile.empty else Tile.full (read x)
 
 almost1024 :: Board 
 almost1024 = parseBoard $ concat $ intersperse "|" $
@@ -414,43 +349,44 @@ mainSolver = do
 
 mainAuto :: IO ()
 mainAuto = do
-    gen   <- getStdGen
-    solve <- mainSolver
-    let (boardInit, gen') = spawnPiece boardEmpty gen
-    go solve boardInit gen'
+    gen       <- stToIO MWC.create
+    solve     <- mainSolver
+    boardInit <- stToIO $ spawnPiece Board.empty gen
+    go solve gen boardInit
   where
-    go solve board0 gen0 = do
+    go solve gen board0 = do
         drawBoard board0
         mbMove <- solve board0
         case mbMove of
             Nothing   -> drawBoard board0
             Just move -> do
-                 Just (board1, gen1) <- return $ play board0 move gen0
-                 go solve board1 gen1
+                 Just board1 <- stToIO $ play gen board0 move
+                 go solve gen board1
 
 mainPlay :: IO ()
 mainPlay = do
     hSetBuffering stdin NoBuffering
 
-    gen   <- getStdGen
-    solve <- mainSolver
-    let (boardInit, gen') = spawnPiece boardEmpty gen
-    go solve boardInit gen'
+    gen       <- stToIO MWC.create
+    solve     <- mainSolver
+    boardInit <- stToIO $ spawnPiece Board.empty gen
+    go solve gen boardInit
   where
-    go solve board0 gen0 = do
+    go solve gen board0 = do
         drawBoard board0
         showSuggestedMove solve board0
-        (board1, gen1) <- getAndApplyMove board0 gen0
-        go solve board1 gen1
+        board1 <- getAndApplyMove gen board0
+        go solve gen board1
 
-    getAndApplyMove board0 gen0 = do
+    getAndApplyMove gen board0 = do
         move <- getMove
         putStrLn ""
         putStrLn ""
         putStrLn ""
-        case play board0 move gen0 of
-            Nothing             -> getAndApplyMove board0 gen0
-            Just (board1, gen1) -> return (board1, gen1)
+        mbBoard1 <- stToIO $ play gen board0 move
+        case mbBoard1 of
+            Nothing     -> getAndApplyMove gen board0
+            Just board1 -> return board1
 
     getMove :: IO Move
     getMove = do
